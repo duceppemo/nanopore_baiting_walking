@@ -158,7 +158,7 @@ fi
 #################
 
 
-#using albacore
+# using albacore
 # https://github.com/metagenomics/denbi-nanopore-training/blob/master/docs/basecalling/basecalling.rst
 # https://github.com/rrwick/Basecalling-comparison
 
@@ -244,8 +244,11 @@ function merge ()
     fastq_folder="$1"
     output_prefix="$2"
 
-    cat "${fastq_folder}"/*.fastq \
-            > "${fastq_folder}"/"${output_prefix}".fastq
+    mkdir -p "${fastq_folder}"/originals
+    mv "${fastq_folder}"/*.fastq "${fastq_folder}"/originals
+
+    cat "${fastq_folder}"/originals/*.fastq \
+        > "${fastq_folder}"/"${output_prefix}".fastq
 }
 
 
@@ -262,26 +265,50 @@ function clump ()
         out="${fastq_folder}"/"${output_prefix}".fastq.gz \
         reorder \
         ziplevel=9
+
+    rm "${fastq_folder}"/"${output_prefix}".fastq
 }
 
 
 function trim ()
 {
     input_fastq="$1"
-    output_fastq="$2"
-    log="$3"  # "${logs}"/"${prefix}"_all_porechop.log
 
     # Trim adapters
     porechop \
         --check_reads 1000 \
         -i "$input_fastq" \
-        -o "$output_fastq" \
+        -o "${input_fastq%.fastq.gz}_trimmed.fastq.gz" \
         --threads "$cpu" \
-        | tee "$log"
+        | tee "${input_fastq%.fastq.gz}".porechop.log
 
     #remove %lines from log
-    cat "$log" | grep -v '%' > "$log".tmp
-    mv "$log".tmp "$log"
+    cat "${input_fastq%.fastq.gz}".porechop.log \
+         | grep -v '%' \
+         > "${input_fastq%.fastq.gz}".porechop.log.tmp
+
+    mv "${input_fastq%.fastq.gz}".porechop.log.tmp \
+        "${input_fastq%.fastq.gz}".porechop.log
+}
+
+
+function remove_chimera ()
+{
+    input_fastq="$1"
+    output_folder="$2"
+
+    filename="$(basename "$input_fastq")"
+    name="${filename%.fastq.gz}"
+
+    vsearch \
+        --gzip_decompress \
+        --threads "$cpu" \
+        --log "${output_folder}"/"${name}".vsearch.log \
+        --minseqlength 32 \
+        --maxseqlength 50000 \
+        --uchime_denovo "$input_fastq" \
+        --nonchimeras "${output_folder}"/"${name}"_nonchimeras.fasta \
+        --chimeras "${output_folder}"/"${name}"_chimeras.fasta
 }
 
 
@@ -588,6 +615,7 @@ function gwalk ()
     ref="$1"  # fasta files
     input_fastq="$2"  # gzipped fastq file: ".fastq.gz"
     direction="$3"
+    mode="$4"
 
     output_folder="$(dirname "$input_fastq")"
     filename="$(basename "$input_fastq")"
@@ -600,10 +628,10 @@ function gwalk ()
     fi
 
     # find fasta entry length
-    ref_len=$(cat "$ref" \
-        | sed -e '1d' \
-        | tr -d "\n" \
-        | awk '{ print length }')
+    # ref_len=$(cat "$ref" \
+    #     | sed -e '1d' \
+    #     | tr -d "\n" \
+    #     | awk '{ print length }')
 
     map_bowtie2 "$ref" "$input_fastq"  # align reads
 
@@ -612,27 +640,17 @@ function gwalk ()
 
     # $6 -> Cigar string (S=soft clipped)
     # $4 -> 1-based leftmost mapping POSition (relative to the read)
-    # $2 == 16 -> revers complement
-
+    # $2 == 16 -> reverse complement (POS 1 is still the first base on the left)
     if [ "$direction" = "left" ]; then
         bamtools convert -format sam -in "${output_folder}"/"${name}".bam \
-        | awk '{
-        if($2 != 16 && $4 == 1 && $6 ~ /^[0-9][0-9][0-9]S/) {
+        | awk -F $'\t' 'BEGIN {OFS = FS} {
+        if($6 ~ /^[0-9][0-9][0-9]S/) {
             print
         }
-        else if($2 != 16 && $4 == 1 && $6 ~ /^[0-9][0-9][0-9][0-9]S/) {
+        else if($6 ~ /^[0-9][0-9][0-9][0-9]S/) {
             print
         }
-        else if($2 != 16 && $4 == 1 && $6 ~ /^[0-9][0-9][0-9][0-9][0-9]S/) {
-            print
-        }
-        else if($2 == 16 && $6 ~ /[0-9][0-9][0-9]S$/) {
-            print
-        }
-        else if($2 == 16 && $6 ~ /[0-9][0-9][0-9][0-9]S$/) {
-            print
-        }
-        else if($2 == 16 && $6 ~ /[0-9][0-9][0-9][0-9][0-9]S$/) {
+        else if($6 ~ /^[0-9][0-9][0-9][0-9][0-9]S/) {
             print
         }
         else if ($0 ~ /^@/) {
@@ -640,28 +658,19 @@ function gwalk ()
         }
         }' | \
         samtools view -@ "$cpu" -b -h -F 4 - | \
-        samtools sort -@ "$cpu" -m 10G -o "${output_folder}"/"${name}"_"${direction}"_overhang.bam - | \
+        samtools sort -@ "$cpu" -m 10G -o "${output_folder}"/"${name}"_"${direction}"_overhang.bam -
         samtools index "${output_folder}"/"${name}"_"${direction}"_overhang.bam
 
     elif [[ "$direction" == "right" ]]; then
         bamtools convert -format sam -in "${output_folder}"/"${name}".bam \
-        | awk -v len="$ref_len" '{
-        if($2 != 16 && $6 ~ /[0-9][0-9][0-9]S$/) {
+        | awk -F $'\t' 'BEGIN {OFS = FS} {
+        if($6 ~ /[0-9][0-9][0-9]S$/) {
             print
         }
-        else if($2 != 16 && $6 ~ /[0-9][0-9][0-9][0-9]S$/) {
+        else if($6 ~ /[0-9][0-9][0-9][0-9]S$/) {
             print
         }
-        else if($2 != 16 && $6 ~ /[0-9][0-9][0-9][0-9][0-9]S$/) {
-            print
-        }
-        else if($2 == 16 && $6 ~ /^[0-9][0-9][0-9]S/) {
-            print
-        }
-        else if($2 == 16 && $6 ~ /^[0-9][0-9][0-9][0-9]S/) {
-            print
-        }
-        else if($2 == 16 && $6 ~ /^[0-9][0-9][0-9][0-9][0-9]S/) {
+        else if($6 ~ /[0-9][0-9][0-9][0-9][0-9]S$/) {
             print
         }
         else if ($0 ~ /^@/) {
@@ -669,7 +678,7 @@ function gwalk ()
         }
         }' | \
         samtools view -@ "$cpu" -b -h -F 4 - | \
-        samtools sort -@ "$cpu" -m 10G -o "${output_folder}"/"${name}"_"${direction}"_overhang.bam - | \
+        samtools sort -@ "$cpu" -m 10G -o "${output_folder}"/"${name}"_"${direction}"_overhang.bam -
         samtools index "${output_folder}"/"${name}"_"${direction}"_overhang.bam
     else
         echo "Please provide a direction for the walking (\"left\" or \"right\")"
@@ -677,11 +686,7 @@ function gwalk ()
     fi
 
     #visualize filtered alignment
-    tablet "${output_folder}"/"${name}"_left_overhang.bam "$target" &
-
-    # run_blastn \
-    #     "${mapped}"/"${prefix}"_softclipped.fasta \
-    #     "$target"
+    tablet "${output_folder}"/"${name}"_"${direction}"_overhang.bam "$target" &
 }
 
 
@@ -729,6 +734,13 @@ call_bases_1D \
 
 
 # Starting from fastq
+#merge and clump all fastq
+clump "$read_folder" "$prefix"
+
+#trim nanopore squencing adapter/split chimeras
+trim "${read_folder}"/"${prefix}".fastq.gz
+
+reads="${read_folder}"/"${prefix}"_trimmed.fastq.gz
 
 # QC trimmed reads
 run_fastqc \
@@ -748,7 +760,8 @@ make_blastDB "$target"
 # Convert baited reads to fasta
 fastq2fasta "${matched}"/"${prefix}".fastq.gz
 
-# Filter the baited reads using blast to minimize fasle positives 
+# Filter the baited reads using blast to minimize fasle positives
+# NOS, Promoter, Intron, EPSPS, 35S
 filter_blast \
     "${matched}"/"${prefix}".fasta \
     "$target" \
@@ -760,7 +773,7 @@ gwalk \
     "$target" \
     "${matched}"/"${prefix}"-filtered.fastq.gz \
     "left"
- 
+
 # Find reads with long right overhang
 gwalk \
     "$target" \
@@ -787,6 +800,7 @@ assemble_canu \
     "${matched}/canu" \
     "$size"
 
+# This one seems to work the best
 assemble_unicycler \
     "${matched}"/"${prefix}"-filtered_left_right_overhangs.fastq.gz \
     "$prefix" \
