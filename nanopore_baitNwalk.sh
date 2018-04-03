@@ -14,7 +14,6 @@
 ######################
 
 
-# baseDir=""${HOME}"/analyses/gwalk"
 baseDir=""${HOME}"/analyses/gwalk"
 prefix="gwalk"
 
@@ -110,7 +109,6 @@ else
     exit 1
 fi
 
-
 # Canu
 if hash canu 2>/dev/null; then
     canu --version | tee -a "${logs}"/log.txt
@@ -136,10 +134,37 @@ else
     exit 1
 fi
 
+# Python 3
+if hash python3 2>/dev/null; then
+    python3 --version | tee -a "${logs}"/log.txt
+else
+    echo >&2 "Python3 was not found. Aborting." | tee -a "${logs}"/log.txt
+    exit 1
+fi
+
 # Unicycler
+if hash python3 "${prog}"/Unicycler/unicycler-runner.py 2>/dev/null; then
+    python3 "${prog}"/Unicycler/unicycler-runner.py --version | tee -a "${logs}"/log.txt
+else
+    echo >&2 "Unicycler was not found. Aborting." | tee -a "${logs}"/log.txt
+    exit 1
+fi
 
 # Blast
+if hash blastn 2>/dev/null; then
+    blastn -version | tee -a "${logs}"/log.txt
+else
+    echo >&2 "blast was not found. Aborting." | tee -a "${logs}"/log.txt
+    exit 1
+fi
 
+# Parallel
+if hash parallel 2>/dev/null; then
+    parallel --version | head -n 1 | tee -a "${logs}"/log.txt
+else
+    echo >&2 "GNU parallel was not found. Aborting." | tee -a "${logs}"/log.txt
+    exit 1
+fi
 
 # Albacore
 if hash read_fast5_basecaller.py 2>/dev/null; then
@@ -150,7 +175,6 @@ else
 fi
 
 
-
 #################
 #               #
 #   Functions   #
@@ -158,31 +182,78 @@ fi
 #################
 
 
-# using albacore
+function fetch_fast5_from_tmp ()
+{
+    # ".fast5.tmp" are the raw fast5 files waiting to be basecalled
+    # After basecalling, the fastq sequence is written inside the fast5 file
+    # and the fast5 is moved back to the run folder (in pass or fail subfolder).
+    # The fastq file get w also moved back toin the "tmp" folder
+
+    input_folder="$1"
+    output_folder="$2"
+    keywork="$3"
+
+    find "$input_folder" \
+        -type f \
+        -name "*${keyword}*.fast5.tmp" \
+        -exec mv {} "$output_folder" \;
+}
+
+
+# Rename temporary files
+function rename_tmp ()
+{
+    input_folder="$1"
+
+    # Remove the ".tmp" from the file name
+    find "$input_folder" -type f -name "*.fast5.tmp" \
+        | parallel --bar 'mv {} {.}'
+}
+
+
+#using albacore
 # https://github.com/metagenomics/denbi-nanopore-training/blob/master/docs/basecalling/basecalling.rst
 # https://github.com/rrwick/Basecalling-comparison
 
+# Base calling
+# http://simpsonlab.github.io/2015/12/18/kdtree-mapping/
+
 function call_bases_1D()
 {
+    # Will not do basecalling on ".fast5.tmp" files. They need to be renamed
 
     kit="$1"  # "SQK-LSK108"
     flow="$2"  # "FLO-MIN106"
-    input_fast5="$3"  # top folder - will look recursively for fast5 files because "-r" option
-    output_fastq="$4"
+    fast5_folder="$3"  # top folder - will look recursively for fast5 files because "-r" option
+    fastq_folder="$4"
+    barcoded="$5"
 
-    # will bin reads in pass/fail folder
-    read_fast5_basecaller.py \
-        -i "$input_fast5" \
-        -t "$cpu" \
-        -s "$output_fastq" \
-        -k "$kit" \
-        -f "$flow" \
-        -r \
-        -o "fastq" \
-        -q 0 \
-        --disable_pings
+    if [[ "$barcoded" == "barcoded" ]]; then
+        read_fast5_basecaller.py \
+            -i "$fast5_folder" \
+            --barcoding \
+            -t "$cpu" \
+            -s "$fastq_folder" \
+            -k "$kit" \
+            -f "$flow" \
+            -r \
+            -o "fastq" \
+            -q 0 \
+            --disable_pings
+    else
+        read_fast5_basecaller.py \
+            -i "$fast5_folder" \
+            -t "$cpu" \
+            -s "$fastq_folder" \
+            -k "$kit" \
+            -f "$flow" \
+            -r \
+            -o "fastq" \
+            -q 0 \
+            --disable_pings
 
-    #files of most interest are found in "${output_fastq}"/workplace/pass
+        #files of most interest are found in "${fastq_folder}"/workplace/pass
+    fi
 }
 
 
@@ -205,6 +276,23 @@ function call_bases_1D2()
         -o "fastq" \
         -q 0 \
         --disable_pings
+}
+
+
+function remove_lambda ()
+{
+    input_fastq="$1"
+    ref=""
+
+    bbduk.sh "$memJava" \
+        in="$input_fastq" \
+        ref=/media/6tb_raid10/ref/MG495226.1.fasta \
+        k=31 \
+        out="${trimmed}"/"${prefix}"_ccs_Cleaned.fastq.gz \
+        ziplevel=9 \
+        ordered=t \
+        2> >(tee "${logs}"/pacbio_ccs_cleaning.txt)
+
 }
 
 
@@ -316,8 +404,22 @@ function bait_bbduk ()
 {
     input_file="$1"  #fasta or fastq, gzipped or not
     target_fasta="$2"
-    match_file="$3"
-    log="$4"  # "${logs}"/bbduk_extraction.log
+    output_folder="$3"
+
+    #Check is input file is fasta or fastq
+    if [ $(echo "$input_file" | grep -F ".fastq.gz") ]; then
+        file_ext=".fastq.gz"
+    elif [ $(echo "$input_file" | grep -F ".fastq") ]; then
+        file_ext=".fastq"
+    elif [ $(echo "$input_file" | grep -F ".fasta") ]; then
+        file_ext=".fasta"
+    else
+        echo "Wrong input file format. Please use \".fasta\", \".fastq\" or \".fastq.gz\""
+        exit 1
+    fi
+
+    # filename="$(basename "$target_fasta")"
+    # name="${filename%.fasta}"
 
     bbduk.sh "$memJava" \
         overwrite=true \
@@ -325,10 +427,11 @@ function bait_bbduk ()
         ref="$target_fasta" \
         threads="$cpu" \
         k=31 \
+        maskmiddle=t \
         hdist=2 \
-        outm="$match_file" \
+        outm="${output_folder}"/"${prefix}".matched"${file_ext}" \
         ziplevel=9 \
-        2> >(tee "$log")
+        2> >(tee "${output_folder}"/"${prefix}".bbduk.log)
 }
 
 
@@ -336,9 +439,36 @@ function fastq2fasta ()
 {
     input_fastq="$1"  # assume gzipped file
 
-    zcat "$input_fastq" \
+    if [ $(echo "$input_file" | grep -F ".fastq.gz") ]; then
+        zcat "$input_fastq" \
         | sed -n '1~4s/^@/>/p;2~4p' \
         > "${input_fastq%.fastq.gz}.fasta"
+    elif [ $(echo "$input_file" | grep -F ".fastq") ]; then
+        cat "$input_fastq" \
+        | sed -n '1~4s/^@/>/p;2~4p' \
+        > "${input_fastq%.fastq}.fasta"
+    else
+        echo "Wrong file extension. Please use \".fastq\" or \".fastq.gz\""
+        exit 1
+    fi
+
+    # #using BBtools
+    # #Check is input file is fasta or fastq
+    # if [ $(echo "$input_file" | grep -F ".fastq.gz") ]; then
+    #     file_ext=".fastq.gz"
+    # elif [ $(echo "$input_file" | grep -F ".fastq") ]; then
+    #     file_ext=".fastq"
+    # elif [ $(echo "$input_file" | grep -F ".fasta") ]; then
+    #     file_ext=".fasta"
+    # else
+    #     echo "Wrong input file format. Please use \".fasta\", \".fastq\" or \".fastq.gz\""
+    #     exit 1
+    # fi
+
+    # reformat.sh "$memJava" \
+    #     ow=t \
+    #     in="$input_fastq" \
+    #     out="${input_fastq%${file_ext}}.fasta"
 }
 
 
@@ -365,13 +495,14 @@ function run_blastn()
         -out "${query_fasta%.fasta}".blastn.tsv \
         -evalue "10" \
         -word_size 28 \
-        -outfmt '6 qseqid sseqid stitle pident length mismatch gapopen qlen qstart qend slen sstart send evalue bitscore sseq' \
+        -soft_masking "false" \
+        -dust "no" \
+        -outfmt '6 qseqid sseqid stitle pident length mismatch gapopen qlen qstart qend slen sstart send evalue bitscore' \
         -num_threads "$cpu" \
         -max_target_seqs 10 \
         -max_hsps 10
 
-
-    echo -e "qseqid\tsseqid\tstitle\tpident\tlength\tmismatch\tgapopen\tqlen\tqstart\tqend\tslen\tsstart\tsend\tevalue\tbitscore\tsseq" \
+    echo -e "qseqid\tsseqid\tstitle\tpident\tlength\tmismatch\tgapopen\tqlen\tqstart\tqend\tslen\tsstart\tsend\tevalue\tbitscore" \
         > "${query_fasta%.fasta}".blastn.tsv.tmp
     cat "${query_fasta%.fasta}".blastn.tsv >> "${query_fasta%.fasta}".blastn.tsv.tmp
     mv "${query_fasta%.fasta}".blastn.tsv.tmp "${query_fasta%.fasta}".blastn.tsv
@@ -389,17 +520,59 @@ function filter_blast ()
         "$input_fasta" \
         "$target_fasta"
 
-    #extract matching reads
+    # # Extract matching reads
     cat "${input_fasta%.fasta}".blastn.tsv \
         | sed -e '1d' \
         | grep -F "$pattern" \
         | cut -f 1 \
         | sort | uniq \
-        > "${input_fasta%.fasta}".readlist
+        > "${input_fasta%.fasta}"."${pattern}".readlist
 
-    zcat "$input_fastq" \
-        | LC_ALL=C grep --no-group-separator -A 3 -F -f "${input_fasta%.fasta}".readlist \
-        | pigz > "${input_fasta%.fasta}"-filtered.fastq.gz
+    # Output a filtered blast file
+    cat "${input_fasta%.fasta}".blastn.tsv \
+        | head -n 1 \
+        > "${input_fasta%.fasta}".blastn.filtered."${pattern}".tsv
+
+    cat "${input_fasta%.fasta}".blastn.tsv \
+        | sed -e '1d' \
+        | grep -F -f "${input_fasta%.fasta}"."${pattern}".readlist \
+        >> "${input_fasta%.fasta}".blastn.filtered."${pattern}".tsv
+
+    if [ $(echo "$input_file" | grep -F ".fastq.gz") ]; then
+        zcat "$input_fastq" \
+            | LC_ALL=C grep --no-group-separator -A 3 -F -f "${input_fasta%.fasta}"."${pattern}".readlist \
+            | pigz > "${input_fasta%.fasta}".filtered."${pattern}".fastq.gz
+    elif [ $(echo "$input_file" | grep -F ".fastq") ]; then
+        cat "$input_fastq" \
+            | LC_ALL=C grep --no-group-separator -A 3 -F -f "${input_fasta%.fasta}"."${pattern}".readlist \
+            | pigz > "${input_fasta%.fasta}".filtered."${pattern}".fastq.gz
+    fi
+
+    # # Using BBtools
+    # # Extract matching reads
+    # cat "${input_fasta%.fasta}".blastn.tsv \
+    #     | sed -e '1d' \
+    #     | grep -F "$pattern" \
+    #     | cut -f 1 \
+    #     | sort | uniq \
+    #     | tr "\n" "," \
+    #     | sed 's/,$//' \
+    #     > "${input_fasta%.fasta}"."${pattern}".readlist.bbduk
+
+    # # Output a filtered blast file
+    # cat "${input_fasta%.fasta}".blastn.tsv \
+    #     | head -n 1 \
+    #     > "${input_fasta%.fasta}".blastn.filtered."${pattern}".tsv
+
+    # cat "${input_fasta%.fasta}".blastn.tsv \
+    #     | sed -e '1d' \
+    #     | grep -F -f "${input_fasta%.fasta}"."${pattern}".readlist \
+    #     >> "${input_fasta%.fasta}".blastn.filtered."${pattern}".tsv
+
+    # getreads.sh "$memJava" \
+    #     in="$input_fastq" \
+    #     id=$(cat "${input_fasta%.fasta}"."${pattern}".readlist.bbduk) \
+    #     out="${input_fasta%.fasta}".filtered."${pattern}".fastq.gz
 }
 
 
@@ -408,14 +581,17 @@ function map_graphmap()
     ref="$1"  # assume file ending with ".fasta"
     input_reads="$2" # assume single end gzipped fastq file or fasta
 
-    if [ $(echo "$input_fasta" | grep -F ".fastq.gz") ]; then
+    if [ $(echo "$input_reads" | grep -F ".fastq.gz") ]; then
         file_ext=".fastq.gz"
-    elif [ $(echo "$input_fasta" | grep -F "fasta") ]; then
+    elif [ $(echo "$input_reads" | grep -F ".fastq") ]; then
+        file_ext=".fastq"
+    elif [ $(echo "$input_reads" | grep -F "fasta") ]; then
         file_ext=".fasta"
     else
-        echo "Wrong file extension. Please use \".fasta\" or \".fastq.gz\""
+        echo "Wrong file extension. Please use \".fasta\", \".fastq\" or \".fastq.gz\""
         exit 1
     fi
+
 
     graphmap align \
         -t "$cpu" \
@@ -426,7 +602,7 @@ function map_graphmap()
     samtools sort -@ "$cpu" -m 10G -o "${input_reads%${file_ext}}".bam -
 
     #index bam file 
-    samtools index "${2%${file_ext}}".bam
+    samtools index "${input_reads%${file_ext}}".bam
 }
 
 
@@ -437,10 +613,12 @@ function map_bowtie2 ()
 
     if [ $(echo "$input_reads" | grep -F ".fastq.gz") ]; then
         file_ext=".fastq.gz"
+    elif [ $(echo "$input_reads" | grep -F ".fastq") ]; then
+        file_ext=".fastq"
     elif [ $(echo "$input_reads" | grep -F "fasta") ]; then
         file_ext=".fasta"
     else
-        echo "Wrong file extension. Please use \".fasta\" or \".fastq.gz\""
+        echo "Wrong file extension. Please use \".fasta\", \".fastq\" or \".fastq.gz\""
         exit 1
     fi
 
@@ -466,15 +644,20 @@ function map_bowtie2 ()
 function convert_bam2fastq ()
 {
     input_bam="$1"
-    output_fastq="$2"
 
-    #convert bam to fastq
-    bedtools bamtofastq  \
-        -i "$input_bam" \
-        -fq "$output_fastq"
+    # #convert bam to fastq
+    # bedtools bamtofastq  \
+    #     -i "$input_bam" \
+    #     -fq "${input_bam%.bam}".fastq
 
-    #compress file
-    pigz -f "$output_fastq"
+    # #compress file
+    # pigz -f "${input_bam%.bam}".fastq
+
+    reformat.sh "$memJava" \
+        ow=t \
+        zl=9 \
+        in="$input_bam" \
+        out="${input_bam%.bam}".fastq.gz
 }
 
 
@@ -592,22 +775,22 @@ function polish ()
 }
 
 
-function run_blasr()
-{
-    input_fasta="$1"
-    ref="$2"
+# function run_blasr()
+# {
+#     input_fasta="$1"
+#     ref="$2"
 
-    blasr \
-        --nproc 48 \
-        "$input_fasta" \
-        "$ref" \
-        > "${input_fasta%.fasta}".blasr.tsv
+#     blasr \
+#         --nproc 48 \
+#         "$input_fasta" \
+#         "$ref" \
+#         > "${input_fasta%.fasta}".blasr.tsv
 
-    echo -e "qName\ttName\tqStrand\ttStrand\tscore\tpercentSimilarity\ttStart\ttEnd\ttLength\tqStart\tqEnd\tqLength\tnCells" \
-        > "${input_fasta%.fasta}".blasr.tsv.tmp
-    cat "${input_fasta%.fasta}".blasr.tsv | tr " " "\t" >> "${input_fasta%.fasta}".blasr.tsv.tmp
-    mv "${input_fasta%.fasta}".blasr.tsv.tmp "${input_fasta%.fasta}".blasr.tsv
-}
+#     echo -e "qName\ttName\tqStrand\ttStrand\tscore\tpercentSimilarity\ttStart\ttEnd\ttLength\tqStart\tqEnd\tqLength\tnCells" \
+#         > "${input_fasta%.fasta}".blasr.tsv.tmp
+#     cat "${input_fasta%.fasta}".blasr.tsv | tr " " "\t" >> "${input_fasta%.fasta}".blasr.tsv.tmp
+#     mv "${input_fasta%.fasta}".blasr.tsv.tmp "${input_fasta%.fasta}".blasr.tsv
+# }
 
 
 function gwalk ()
@@ -615,17 +798,16 @@ function gwalk ()
     ref="$1"  # fasta files
     input_fastq="$2"  # gzipped fastq file: ".fastq.gz"
     direction="$3"
-    mode="$4"
 
     output_folder="$(dirname "$input_fastq")"
     filename="$(basename "$input_fastq")"
     name="${filename%.fastq.gz}"
 
-    # check that "$ref" has only one enty
-    if [[ $(echo "$ref" | grep -cF ">") -gt 1 ]]; then
-        echo "Please use a reference fasta file with a single entry only."
-        exit 1
-    fi
+    # # check that "$ref" has only one enty
+    # if [[ $(echo "$ref" | grep -cF ">") -gt 1 ]]; then
+    #     echo "Please use a reference fasta file with a single entry only."
+    #     exit 1
+    # fi
 
     # find fasta entry length
     # ref_len=$(cat "$ref" \
@@ -740,8 +922,6 @@ clump "$read_folder" "$prefix"
 #trim nanopore squencing adapter/split chimeras
 trim "${read_folder}"/"${prefix}".fastq.gz
 
-reads="${read_folder}"/"${prefix}"_trimmed.fastq.gz
-
 # QC trimmed reads
 run_fastqc \
     "$reads" \
@@ -751,19 +931,18 @@ run_fastqc \
 bait_bbduk \
     "$reads" \
     "$target" \
-    "${matched}"/"${prefix}".fastq.gz \
-    "${matched}"/"${prefix}".log
+    "$matched"
 
 # Make a blast database with target sequence(s)
 make_blastDB "$target"
 
 # Convert baited reads to fasta
-fastq2fasta "${matched}"/"${prefix}".fastq.gz
+fastq2fasta "${matched}"/"${prefix}".matched.fastq.gz
 
 # Filter the baited reads using blast to minimize fasle positives
 # NOS, Promoter, Intron, EPSPS, 35S
 filter_blast \
-    "${matched}"/"${prefix}".fasta \
+    "${matched}"/"${prefix}".matched.fasta \
     "$target" \
     "$reads" \
     "NOS"
@@ -771,48 +950,44 @@ filter_blast \
 # Find reads with long left overhang
 gwalk \
     "$target" \
-    "${matched}"/"${prefix}"-filtered.fastq.gz \
+    "${matched}"/"${prefix}".matched.filtered.fastq.gz \
     "left"
 
 # Find reads with long right overhang
 gwalk \
     "$target" \
-    "${matched}"/"${prefix}"-filtered.fastq.gz \
+    "${matched}"/"${prefix}".matched.filtered.fastq.gz \
     "right"
 
 #convert bam to fastq
-convert_bam2fastq \
-    "${matched}"/"${prefix}"-filtered_left_overhang.bam \
-    "${matched}"/"${prefix}"-filtered_left_overhang.fastq
-convert_bam2fastq \
-    "${matched}"/"${prefix}"-filtered_right_overhang.bam \
-    "${matched}"/"${prefix}"-filtered_right_overhang.fastq
+convert_bam2fastq "${matched}"/"${prefix}".filtered_left_overhang.bam
+convert_bam2fastq "${matched}"/"${prefix}".filtered_right_overhang.bam \
 
 #merge both overhang fastq files
-cat "${matched}"/"${prefix}"-filtered_left_overhang.fastq.gz \
-    "${matched}"/"${prefix}"-filtered_right_overhang.fastq.gz \
-    > "${matched}"/"${prefix}"-filtered_left_right_overhangs.fastq.gz
+cat "${matched}"/"${prefix}".filtered_left_overhang.fastq.gz \
+    "${matched}"/"${prefix}".filtered_right_overhang.fastq.gz \
+    > "${matched}"/"${prefix}".filtered_left_right_overhangs.fastq.gz
 
 #assemble the reads from the genome walking
 assemble_canu \
-    "${matched}"/"${prefix}"-filtered_left_right_overhangs.fastq.gz \
+    "${matched}"/"${prefix}".filtered_left_right_overhangs.fastq.gz \
     "$prefix" \
     "${matched}/canu" \
     "$size"
 
 # This one seems to work the best
 assemble_unicycler \
-    "${matched}"/"${prefix}"-filtered_left_right_overhangs.fastq.gz \
+    "${matched}"/"${prefix}".filtered_left_right_overhangs.fastq.gz \
     "$prefix" \
     "${matched}/unicycler" \
     "short"
 
 assemble_unicycler \
-    "${matched}"/"${prefix}"-filtered_left_right_overhangs.fastq.gz \
+    "${matched}"/"${prefix}".filtered_left_right_overhangs.fastq.gz \
     "$prefix" \
     "${matched}/unicycler" \
     "long"
 
 assemble_spades \
-    "${matched}"/"${prefix}"-filtered_left_right_overhangs.fastq.gz \
+    "${matched}"/"${prefix}".filtered_left_right_overhangs.fastq.gz \
     "${matched}/spades"
